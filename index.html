@@ -81,6 +81,24 @@
             color: #666;
         }
 
+        .link-marker {
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            background: #e6194b;
+            border: 3px solid #fff;
+            box-shadow: 0 0 0 2px #e6194b, 0 2px 8px rgba(0,0,0,0.6);
+        }
+
+        .copy-link-control a {
+            font-size: 16px;
+            color: #333;
+        }
+
+        .copy-link-control a.copied {
+            color: #2a9d3a;
+        }
+
     </style>
 
 </head>
@@ -256,10 +274,95 @@ var esriImageryLabels = L.featureGroup([esriImagery, esriLabels]);
         // Show 'Şehir Haritası' by default
         map.addLayer(osmTransparent);
 
-        //initiating the side bar
+        // ---- Location links (URL state) ----
+        // Supported:  #<zoom>/<lat>/<lon>            e.g. #14/41.1216/28.8026
+        //             ?lat=<lat>&lon=<lon>[&z=<zoom>][&marker=0|1][&label=<text>]
+        // The query form shows a marker by default (marker=0 disables it) and is
+        // rewritten to the hash form after it has been applied.
+        function clampZoom(z) {
+          return Math.max(map.getMinZoom(), Math.min(map.getMaxZoom(), Math.round(z)));
+        }
+        function parseNum(v) {
+          if (v === null || v === undefined || !/^\s*-?\d+(\.\d+)?\s*$/.test(v)) return NaN;
+          return parseFloat(v);
+        }
+        function validLatLon(lat, lon) {
+          return isFinite(lat) && isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180;
+        }
+        function parseHash(hash) {
+          var parts = (hash || '').replace(/^#/, '').split('/');
+          if (parts.length !== 3) return null;
+          var z = parseNum(parts[0]), lat = parseNum(parts[1]), lon = parseNum(parts[2]);
+          if (!isFinite(z) || !validLatLon(lat, lon)) return null;
+          return { z: clampZoom(z), lat: lat, lon: lon };
+        }
+        function parseQuery(search) {
+          var q = new URLSearchParams(search || '');
+          if (!q.has('lat') || !q.has('lon')) return null;
+          var lat = parseNum(q.get('lat')), lon = parseNum(q.get('lon'));
+          if (!validLatLon(lat, lon)) return null;
+          var z = q.has('z') ? parseNum(q.get('z')) : NaN;
+          return {
+            z: clampZoom(isFinite(z) ? z : 16),
+            lat: lat,
+            lon: lon,
+            marker: q.get('marker') !== '0',
+            label: (q.get('label') || '').slice(0, 300)
+          };
+        }
+        function viewHash() {
+          var c = map.getCenter();
+          return '#' + map.getZoom() + '/' + c.lat.toFixed(5) + '/' + c.lng.toFixed(5);
+        }
+        function viewUrl() {
+          return location.origin + location.pathname + viewHash();
+        }
+
+        var linkMarker = null;
+        function showLinkMarker(lat, lon, label) {
+          if (linkMarker) map.removeLayer(linkMarker);
+          linkMarker = L.marker([lat, lon], {
+            icon: L.divIcon({ className: '', html: '<div class="link-marker"></div>', iconSize: [22, 22], iconAnchor: [11, 11], popupAnchor: [0, -12] }),
+            zIndexOffset: 1000
+          }).addTo(map);
+          if (label) {
+            var el = document.createElement('div');
+            el.textContent = label; // URL-provided text: never insert as HTML
+            linkMarker.bindPopup(el).openPopup();
+          }
+        }
+
+        var queryTarget = parseQuery(location.search);
+        var hashTarget = queryTarget ? null : parseHash(location.hash);
+        var linkTarget = queryTarget || hashTarget;
+        if (linkTarget) {
+          map.setView([linkTarget.lat, linkTarget.lon], linkTarget.z, { animate: false });
+        }
+        if (queryTarget && queryTarget.marker) {
+          showLinkMarker(queryTarget.lat, queryTarget.lon, queryTarget.label);
+        }
+
+        var hashTimer = null;
+        function writeHash() {
+          clearTimeout(hashTimer);
+          hashTimer = setTimeout(function() {
+            if (location.search || location.hash !== viewHash()) {
+              history.replaceState(null, '', location.pathname + viewHash());
+            }
+          }, 300);
+        }
+        map.on('moveend', writeHash);
+        if (linkTarget) writeHash();
+
+        window.addEventListener('hashchange', function() {
+          var t = parseHash(location.hash);
+          if (t && location.hash !== viewHash()) map.setView([t.lat, t.lon], t.z);
+        });
+
+        //initiating the side bar (kept collapsed when opened via a location link)
         var sidebar = L.control.sidebar({ container: 'sidebar', position: 'right' })
-            .addTo(map)
-            .open('home');
+            .addTo(map);
+        if (!linkTarget) sidebar.open('home');
       // add geolocator
       L.control.locate({
         strings: {
@@ -292,6 +395,36 @@ var esriImageryLabels = L.featureGroup([esriImagery, esriLabels]);
         }
       });
       new OpacityControl().addTo(map);
+
+      // "Copy link to this view" control
+      var CopyLinkControl = L.Control.extend({
+        options: { position: 'topleft' },
+        onAdd: function() {
+          var container = L.DomUtil.create('div', 'leaflet-bar leaflet-control copy-link-control');
+          var a = L.DomUtil.create('a', '', container);
+          a.href = '#';
+          a.title = 'Bu görünümün bağlantısını kopyala';
+          a.setAttribute('role', 'button');
+          a.innerHTML = '<span class="fa fa-link"></span>';
+          L.DomEvent.disableClickPropagation(container);
+          L.DomEvent.on(a, 'click', function(e) {
+            L.DomEvent.preventDefault(e);
+            var url = viewUrl();
+            var done = function() {
+              L.DomUtil.addClass(a, 'copied');
+              a.title = 'Kopyalandı';
+              setTimeout(function() { L.DomUtil.removeClass(a, 'copied'); a.title = 'Bu görünümün bağlantısını kopyala'; }, 1500);
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(url).then(done, function() { window.prompt('Bağlantı:', url); });
+            } else {
+              window.prompt('Bağlantı:', url);
+            }
+          });
+          return container;
+        }
+      });
+      new CopyLinkControl().addTo(map);
 
       // Make Uydu and Şehir Haritası mutually exclusive (simulate radio buttons)
       map.on('overlayadd', function(e) {
